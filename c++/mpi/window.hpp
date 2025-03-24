@@ -55,6 +55,7 @@ namespace mpi {
   template <class BaseType> class window {
     friend class shared_window<BaseType>;
     MPI_Win win{MPI_WIN_NULL};
+    communicator comm;
     bool is_owned{true};
     std::span<BaseType> view;
 
@@ -72,6 +73,7 @@ namespace mpi {
         this->win      = std::exchange(rhs.win, MPI_WIN_NULL);
         this->view     = std::exchange(rhs.view, std::span<BaseType>());
         this->is_owned = std::exchange(rhs.is_owned, true);
+        this->comm     = std::exchange(rhs.comm, communicator(MPI_COMM_NULL));
       }
       return *this;
     }
@@ -88,15 +90,17 @@ namespace mpi {
     * @param size The number of elements of type @p BaseType in the buffer. (default @p 0)
     * @param info Additional MPI information. (default @p MPI_INFO_NULL)
     */
-    explicit window(communicator &c, BaseType *base, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept(false) {
+    explicit window(communicator const &c, BaseType *base, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept(false) {
       ASSERT(size >= 0)
       ASSERT(!(base == nullptr && size > 0))
       if (has_env) {
         MPI_Win_create(base, size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &win);
         view = std::span<BaseType>(base, size);
+        comm = c;
       } else {
         is_owned = false;
         view     = std::span<BaseType>(base, size);
+        comm = c;
       }
     }
 
@@ -112,16 +116,18 @@ namespace mpi {
     * @param size The number of elements of type @p BaseType to allocate. (default @p 0)
     * @param info Additional MPI information. (default @p MPI_INFO_NULL)
     */
-    explicit window(communicator &c, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept {
+    explicit window(communicator  const &c, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept {
       ASSERT(size >= 0)
       if (has_env) {
         void *baseptr = nullptr;
         MPI_Win_allocate(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &win);
         view = std::span<BaseType>(static_cast<BaseType *>(baseptr), size);
+        comm = c;
       } else {
         is_owned          = true;
         BaseType *baseptr = new BaseType[size];
         view              = std::span<BaseType>(baseptr, size);
+        comm = c;
       }
     }
 
@@ -143,6 +149,7 @@ namespace mpi {
     explicit operator MPI_Win *() noexcept { return &win; };
 
     void free() noexcept {
+      /// TODO: check if comm.free() is necessary
       if (has_env) {
         if (win != MPI_WIN_NULL) {
           this->fence();
@@ -407,6 +414,8 @@ namespace mpi {
 
     std::span<BaseType> &data() noexcept { return view; }
     std::span<BaseType> &data() const noexcept { return view; }
+
+    communicator &get_communicator() noexcept { return comm; }
   };
 
   /**
@@ -417,6 +426,8 @@ namespace mpi {
   * @tparam BaseType The data type stored in the shared memory window.
   */
   template <class BaseType> class shared_window : public window<BaseType> {
+    shared_communicator sh_comm;
+
     public:
     /// Default constructor
     shared_window() = default;
@@ -430,16 +441,18 @@ namespace mpi {
      * @param size The number of elements of type @p BaseType to allocate.
      * @param info MPI_Info object for optimization hints.
      */
-    explicit shared_window(shared_communicator &c, MPI_Aint size, MPI_Info info = MPI_INFO_NULL) noexcept {
+    explicit shared_window(shared_communicator const &c, MPI_Aint size, MPI_Info info = MPI_INFO_NULL) noexcept {
       ASSERT(size >= 0)
       if (has_env) {
         void *baseptr = nullptr;
         MPI_Win_allocate_shared(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &(this->win));
         this->view = std::span<BaseType>(static_cast<BaseType *>(baseptr), size);
+        sh_comm = c;
       } else {
         this->is_owned    = true;
         BaseType *baseptr = new BaseType[size];
         this->view        = std::span<BaseType>(baseptr, size);
+        sh_comm = c;
       }
     }
 
@@ -488,6 +501,8 @@ namespace mpi {
      * @return The displacement unit.
      */
     int disp_unit(int rank = MPI_PROC_NULL) const noexcept { return std::get<1>(query(rank)); }
+
+    shared_communicator &get_communicator() { return sh_comm; }
   };
 
   /** @} */
