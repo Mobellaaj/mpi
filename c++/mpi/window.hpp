@@ -54,26 +54,29 @@ namespace mpi {
 
   template <class BaseType> class window {
     friend class shared_window<BaseType>;
-    MPI_Win win{MPI_WIN_NULL};
-    communicator comm;
+    MPI_Win _win{MPI_WIN_NULL};
+    communicator _comm;
     bool is_owned{true};
-    std::span<BaseType> view;
+    BaseType *_data{nullptr};
+    MPI_Aint _size{0};
 
     public:
     window()               = default;
     window(window const &) = delete;
     window(window &&other) noexcept
-       : win{std::exchange(other.win, MPI_WIN_NULL)},
+       : _win{std::exchange(other._win, MPI_WIN_NULL)},
          is_owned{std::exchange(other.is_owned, true)},
-         view{std::exchange(other.view, std::span<BaseType>())} {}
+         _data{std::exchange(other._data, nullptr)},
+         _size{std::exchange(other._size, 0)} {}
     window &operator=(window const &) = delete;
     window &operator=(window &&rhs) noexcept {
       if (this != std::addressof(rhs)) {
         this->free();
-        this->win      = std::exchange(rhs.win, MPI_WIN_NULL);
-        this->view     = std::exchange(rhs.view, std::span<BaseType>());
+        this->_win     = std::exchange(rhs._win, MPI_WIN_NULL);
+        this->_comm    = std::exchange(rhs._comm, communicator(MPI_COMM_NULL));
         this->is_owned = std::exchange(rhs.is_owned, true);
-        this->comm     = std::exchange(rhs.comm, communicator(MPI_COMM_NULL));
+        this->_data    = std::exchange(rhs._data, nullptr);
+        this->_size    = std::exchange(rhs._size, 0);
       }
       return *this;
     }
@@ -90,17 +93,17 @@ namespace mpi {
     * @param size The number of elements of type @p BaseType in the buffer. (default @p 0)
     * @param info Additional MPI information. (default @p MPI_INFO_NULL)
     */
-    explicit window(communicator const &c, BaseType *base, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept(false) {
+    explicit window(communicator const &c, BaseType *base, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept(false) : _comm(c.get()) {
       ASSERT(size >= 0)
       ASSERT(!(base == nullptr && size > 0))
       if (has_env) {
-        MPI_Win_create(base, size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &win);
-        view = std::span<BaseType>(base, size);
-        comm = c;
+        MPI_Win_create(base, size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &_win);
+        _data = base;
+        _size = size;
       } else {
         is_owned = false;
-        view     = std::span<BaseType>(base, size);
-        comm = c;
+        _data    = base;
+        _size    = size;
       }
     }
 
@@ -116,18 +119,17 @@ namespace mpi {
     * @param size The number of elements of type @p BaseType to allocate. (default @p 0)
     * @param info Additional MPI information. (default @p MPI_INFO_NULL)
     */
-    explicit window(communicator  const &c, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept {
+    explicit window(communicator const &c, MPI_Aint size = 0, MPI_Info info = MPI_INFO_NULL) noexcept : _comm(c.get()) {
       ASSERT(size >= 0)
       if (has_env) {
         void *baseptr = nullptr;
-        MPI_Win_allocate(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &win);
-        view = std::span<BaseType>(static_cast<BaseType *>(baseptr), size);
-        comm = c;
+        MPI_Win_allocate(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &_win);
+        _data = static_cast<BaseType *>(baseptr);
+        _size = size;
       } else {
-        is_owned          = true;
-        BaseType *baseptr = new BaseType[size];
-        view              = std::span<BaseType>(baseptr, size);
-        comm = c;
+        is_owned = true;
+        _data    = new BaseType[size];
+        _size    = size;
       }
     }
 
@@ -145,19 +147,19 @@ namespace mpi {
     */
     virtual ~window() { free(); }
 
-    explicit operator MPI_Win() const noexcept { return win; };
-    explicit operator MPI_Win *() noexcept { return &win; };
+    explicit operator MPI_Win() const noexcept { return _win; };
+    explicit operator MPI_Win *() noexcept { return &_win; };
 
     void free() noexcept {
-      /// TODO: check if comm.free() is necessary
       if (has_env) {
-        if (win != MPI_WIN_NULL) {
+        if (_win != MPI_WIN_NULL) {
           this->fence();
-          MPI_Win_free(&win);
+          MPI_Win_free(&_win);
         }
       } else {
-        if (is_owned) { delete[] view.data(); }
-        view = std::span<BaseType>();
+        if (is_owned) { delete[] _data; }
+        _data = nullptr;
+        _size = 0;
       }
     }
 
@@ -172,7 +174,7 @@ namespace mpi {
     * @param assert program assertion.
     */
     void fence(int assert = 0) const noexcept {
-      if (has_env) { MPI_Win_fence(assert, win); }
+      if (has_env) { MPI_Win_fence(assert, _win); }
     }
 
     /**
@@ -186,9 +188,9 @@ namespace mpi {
     void flush(int rank = -1) const noexcept {
       if (has_env) {
         if (rank < 0) {
-          MPI_Win_flush_all(win);
+          MPI_Win_flush_all(_win);
         } else {
-          MPI_Win_flush(rank, win);
+          MPI_Win_flush(rank, _win);
         }
       }
     }
@@ -200,7 +202,7 @@ namespace mpi {
     *          and vice versa.
     */
     void sync() const noexcept {
-      if (has_env) { MPI_Win_sync(win); }
+      if (has_env) { MPI_Win_sync(_win); }
     }
 
     /**
@@ -216,9 +218,9 @@ namespace mpi {
     void lock(int rank = -1, int lock_type = MPI_LOCK_SHARED, int assert = 0) const noexcept {
       if (has_env) {
         if (rank < 0) {
-          MPI_Win_lock_all(assert, win);
+          MPI_Win_lock_all(assert, _win);
         } else {
-          MPI_Win_lock(lock_type, rank, assert, win);
+          MPI_Win_lock(lock_type, rank, assert, _win);
         }
       }
     }
@@ -236,9 +238,9 @@ namespace mpi {
     void unlock(int rank = -1) const noexcept {
       if (has_env) {
         if (rank < 0) {
-          MPI_Win_unlock_all(win);
+          MPI_Win_unlock_all(_win);
         } else {
-          MPI_Win_unlock(rank, win);
+          MPI_Win_unlock(rank, _win);
         }
       }
     }
@@ -250,14 +252,14 @@ namespace mpi {
     * @param assert An assertion flag providing optimization hints to MPI.
     */
     void start(group const &grp, int assert = 0) const noexcept {
-      if (has_env) { MPI_Win_start(grp.get(), assert, win); }
+      if (has_env) { MPI_Win_start(grp.get(), assert, _win); }
     }
 
     /**
     * @brief Completes an RMA access epoch on win started by a call to @p start.
     */
     void complete() const noexcept {
-      if (has_env) { MPI_Win_complete(win); }
+      if (has_env) { MPI_Win_complete(_win); }
     }
 
     /**
@@ -267,14 +269,14 @@ namespace mpi {
     * @param assert An assertion flag providing optimization hints to MPI.
     */
     void post(group const &grp, int assert = 0) const noexcept {
-      if (has_env) { MPI_Win_post(grp.get(), assert, win); }
+      if (has_env) { MPI_Win_post(grp.get(), assert, _win); }
     }
 
     /**
     * @brief Completes an RMA exposure epoch started by a call to @p post.
     */
     void wait() const noexcept {
-      if (has_env) { MPI_Win_wait(win); }
+      if (has_env) { MPI_Win_wait(_win); }
     }
 
     /**
@@ -298,14 +300,14 @@ namespace mpi {
       if (has_env) {
         MPI_Datatype origin_datatype = mpi_type<OriginType>::get();
         MPI_Datatype target_datatype = mpi_type<TargetType>::get();
-        MPI_Get(origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count_, target_datatype, win);
+        MPI_Get(origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count_, target_datatype, _win);
       } else {
         if (target_rank != 0) { return; }
 
         std::span<OriginType> origin(origin_addr, origin_count);
-        auto target_begin = view.begin();
+        BaseType *target_begin = _data;
         std::advance(target_begin, target_disp);
-        auto target_end = target_begin;
+        BaseType *target_end = target_begin;
         std::advance(target_end, target_count_);
         std::copy(target_begin, target_end, origin.begin());
       }
@@ -332,12 +334,12 @@ namespace mpi {
       if (has_env) {
         MPI_Datatype origin_datatype = mpi_type<OriginType>::get();
         MPI_Datatype target_datatype = mpi_type<TargetType>::get();
-        MPI_Put(origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count_, target_datatype, win);
+        MPI_Put(origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count_, target_datatype, _win);
       } else {
         if (target_rank != 0) { return; }
 
         std::span<OriginType> origin(origin_addr, origin_count);
-        auto target_begin = view.begin();
+        BaseType *target_begin = _data;
         std::advance(target_begin, target_disp);
         std::copy(origin.begin(), origin.end(), target_begin);
       }
@@ -355,7 +357,7 @@ namespace mpi {
       if (has_env) {
         int flag;
         void *attribute_val;
-        MPI_Win_get_attr(win, win_keyval, &attribute_val, &flag);
+        MPI_Win_get_attr(_win, win_keyval, &attribute_val, &flag);
         ASSERT(flag)
         return attribute_val;
       } else {
@@ -373,10 +375,10 @@ namespace mpi {
     */
     BaseType *base() const noexcept {
       if (has_env) {
-        if (win == MPI_WIN_NULL) { return nullptr; }
+        if (_win == MPI_WIN_NULL) { return nullptr; }
         return static_cast<BaseType *>(get_attr(MPI_WIN_BASE));
       } else {
-        return view.data();
+        return _data;
       }
     }
 
@@ -392,7 +394,7 @@ namespace mpi {
       if (has_env) {
         return *static_cast<MPI_Aint *>(get_attr(MPI_WIN_SIZE));
       } else {
-        return view.size_bytes();
+        return _size * sizeof(BaseType);
       }
     }
 
@@ -408,14 +410,14 @@ namespace mpi {
       if (has_env) {
         return *static_cast<int *>(get_attr(MPI_WIN_DISP_UNIT));
       } else {
-        return sizeof(decltype(view)::element_type);
+        return sizeof(BaseType);
       }
     }
 
-    std::span<BaseType> &data() noexcept { return view; }
-    std::span<BaseType> &data() const noexcept { return view; }
+    BaseType *&data() noexcept { return _data; }
+    BaseType &data() const noexcept { return _data; }
 
-    communicator &get_communicator() noexcept { return comm; }
+    communicator get_communicator() noexcept { return _comm.get(); }
   };
 
   /**
@@ -426,8 +428,6 @@ namespace mpi {
   * @tparam BaseType The data type stored in the shared memory window.
   */
   template <class BaseType> class shared_window : public window<BaseType> {
-    shared_communicator sh_comm;
-
     public:
     /// Default constructor
     shared_window() = default;
@@ -445,14 +445,15 @@ namespace mpi {
       ASSERT(size >= 0)
       if (has_env) {
         void *baseptr = nullptr;
-        MPI_Win_allocate_shared(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &(this->win));
-        this->view = std::span<BaseType>(static_cast<BaseType *>(baseptr), size);
-        sh_comm = c;
+        MPI_Win_allocate_shared(size * sizeof(BaseType), sizeof(BaseType), info, c.get(), &baseptr, &(this->_win));
+        this->_comm = c.get();
+        this->_data = static_cast<BaseType *>(baseptr);
+        this->_size = size;
       } else {
-        this->is_owned    = true;
-        BaseType *baseptr = new BaseType[size];
-        this->view        = std::span<BaseType>(baseptr, size);
-        sh_comm = c;
+        this->is_owned = true;
+        this->_comm    = c.get();
+        this->_data    = new BaseType[size];
+        this->_size    = size;
       }
     }
 
@@ -469,10 +470,10 @@ namespace mpi {
         MPI_Aint size = 0;
         int disp_unit = 0;
         void *baseptr = nullptr;
-        MPI_Win_shared_query(this->win, rank, &size, &disp_unit, &baseptr);
+        MPI_Win_shared_query(this->_win, rank, &size, &disp_unit, &baseptr);
         return {size, disp_unit, baseptr};
       } else {
-        return {this->view.size_bytes(), sizeof(BaseType), this->view.data()};
+        return {this->_size * sizeof(BaseType), sizeof(BaseType), this->_data};
       }
     }
 
@@ -502,7 +503,7 @@ namespace mpi {
      */
     int disp_unit(int rank = MPI_PROC_NULL) const noexcept { return std::get<1>(query(rank)); }
 
-    shared_communicator &get_communicator() { return sh_comm; }
+    shared_communicator get_communicator() { return this->_comm.get(); }
   };
 
   /** @} */

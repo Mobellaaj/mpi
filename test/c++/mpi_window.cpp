@@ -84,9 +84,7 @@ TEST(MPI_Window, WindowAllocate) {
 
 TEST(MPI_Window, PassiveTargetCommunication) {
   mpi::communicator world;
-  if (world.size() < 2) {
-    GTEST_SKIP() << "Test requires at least 2 processes\n";
-  }
+  if (world.size() < 2) { GTEST_SKIP() << "Test requires at least 2 processes\n"; }
   int rank = world.rank();
 
   auto win_comm = world.split(rank == 0 || rank == 1 ? 0 : MPI_UNDEFINED);
@@ -165,8 +163,8 @@ TEST(MPI_Window, NullptrSizeZero) {
   mpi::communicator world;
   mpi::window<int> win{world, nullptr, 0};
 
-  EXPECT_TRUE(win.data().empty());
-  EXPECT_EQ(win.data().size(), 0);
+  EXPECT_EQ(win.data(), nullptr);
+  EXPECT_EQ(win.size(), 0);
 }
 
 TEST(MPI_Window, OneSidedGet) {
